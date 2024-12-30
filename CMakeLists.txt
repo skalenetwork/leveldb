@@ -34,10 +34,10 @@ test_big_endian(LEVELDB_IS_BIG_ENDIAN)
 include(CheckIncludeFile)
 check_include_file("unistd.h" HAVE_UNISTD_H)
 
-include(CheckLibraryExists)
-check_library_exists(crc32c crc32c_value "" HAVE_CRC32C)
-check_library_exists(snappy snappy_compress "" HAVE_SNAPPY)
-check_library_exists(tcmalloc malloc "" HAVE_TCMALLOC)
+find_package(Crc32c CONFIG REQUIRED)
+set(HAVE_CRC32C TRUE)
+find_package(Snappy CONFIG REQUIRED)
+set(HAVE_SNAPPY TRUE)
 
 include(CheckCXXSymbolExists)
 # Using check_cxx_symbol_exists() instead of check_c_symbol_exists() because
@@ -245,15 +245,7 @@ if(HAVE_CLANG_THREAD_SAFETY)
       -Werror -Wthread-safety)
 endif(HAVE_CLANG_THREAD_SAFETY)
 
-if(HAVE_CRC32C)
-  target_link_libraries(leveldb crc32c)
-endif(HAVE_CRC32C)
-if(HAVE_SNAPPY)
-  target_link_libraries(leveldb snappy)
-endif(HAVE_SNAPPY)
-if(HAVE_TCMALLOC)
-  target_link_libraries(leveldb tcmalloc)
-endif(HAVE_TCMALLOC)
+target_link_libraries(leveldb Crc32c::crc32c Snappy::snappy)
 
 # Needed by port_stdcxx.h
 find_package(Threads REQUIRED)
