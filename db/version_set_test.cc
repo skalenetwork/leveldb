@@ -3,7 +3,17 @@
 // found in the LICENSE file. See the AUTHORS file for names of contributors.
 
 #include "db/version_set.h"
+
+#include <algorithm>
+#include <string>
+#include <vector>
+
+#include "helpers/memenv/memenv.h"
+#include "leveldb/db.h"
+#include "leveldb/env.h"
+#include "port/port.h"
 #include "util/logging.h"
+#include "util/mutexlock.h"
 #include "util/testharness.h"
 #include "util/testutil.h"
 
@@ -325,6 +335,137 @@ TEST(AddBoundaryInputsTest, TestDisjoinFilePointers) {
   ASSERT_EQ(f1, compaction_files_[0]);
   ASSERT_EQ(f4, compaction_files_[1]);
   ASSERT_EQ(f3, compaction_files_[2]);
+}
+
+// Checks which files VersionSet picks for a compaction: CompactRange() goes
+// through SetupOtherInputs().  Picking only looks at file metadata, so the
+// files are described with AddFile() and never written.
+class CompactionInputsTest {
+ public:
+  CompactionInputsTest()
+      : env_(NewMemEnv(Env::Default())),
+        dbname_("/compaction_inputs_test"),
+        icmp_(BytewiseComparator()),
+        versions_(nullptr) {
+    // Recover() needs an existing database, so create an empty one first.
+    Options open_options;
+    open_options.env = env_;
+    open_options.create_if_missing = true;
+    DB* db = nullptr;
+    ASSERT_OK(DB::Open(open_options, dbname_, &db));
+    delete db;
+
+    options_.env = env_;
+    versions_ = new VersionSet(dbname_, &options_, nullptr, &icmp_);
+    bool save_manifest;
+    ASSERT_OK(versions_->Recover(&save_manifest));
+  }
+
+  ~CompactionInputsTest() {
+    delete versions_;
+    delete env_;
+  }
+
+  // Describes a file in |level| whose keys range from |smallest| to |largest|.
+  // It becomes part of the current version with the next Install().
+  void AddFile(int level, uint64_t number, const InternalKey& smallest,
+               const InternalKey& largest) {
+    versions_->MarkFileNumberUsed(number);
+    edit_.AddFile(level, number, 1000 /* file size */, smallest, largest);
+  }
+
+  // Makes the files described so far the current version.
+  void Install() {
+    MutexLock l(&mu_);
+    ASSERT_OK(versions_->LogAndApply(&edit_, &mu_));
+  }
+
+  // Returns the compaction that a manual compaction of the user keys
+  // [begin, end] in |level| starts with.  The caller deletes it.
+  Compaction* PickRange(int level, const char* begin, const char* end) {
+    InternalKey begin_key(begin, kMaxSequenceNumber, kValueTypeForSeek);
+    InternalKey end_key(end, 0, static_cast<ValueType>(0));
+    return versions_->CompactRange(level, &begin_key, &end_key);
+  }
+
+  // Returns the numbers of the files that |c| takes from its first level
+  // (which == 0) or from the level below it (which == 1), in ascending order,
+  // for example "21,22".
+  std::string Inputs(Compaction* c, int which) {
+    std::vector<uint64_t> numbers;
+    for (int i = 0; i < c->num_input_files(which); i++) {
+      numbers.push_back(c->input(which, i)->number);
+    }
+    std::sort(numbers.begin(), numbers.end());
+    std::string result;
+    for (size_t i = 0; i < numbers.size(); i++) {
+      if (i > 0) {
+        result += ",";
+      }
+      result += NumberToString(numbers[i]);
+    }
+    return result;
+  }
+
+ private:
+  Env* env_;
+  std::string dbname_;
+  InternalKeyComparator icmp_;
+  Options options_;
+  port::Mutex mu_;
+  VersionEdit edit_;
+  VersionSet* versions_;
+};
+
+TEST(CompactionInputsTest, IncludesBoundaryFileOfNextLevel) {
+  // Level 1 holds one file.
+  AddFile(1, 11, InternalKey("100", 20, kTypeValue),
+          InternalKey("150", 21, kTypeValue));
+  // In level 2 the two versions of user key "200" are in different files: file
+  // 21 ends with the newer one, a deletion marker, and file 22 starts with the
+  // older one, a value.
+  AddFile(2, 21, InternalKey("100", 3, kTypeValue),
+          InternalKey("200", 9, kTypeDeletion));
+  AddFile(2, 22, InternalKey("200", 5, kTypeValue),
+          InternalKey("300", 4, kTypeValue));
+  Install();
+
+  Compaction* c = PickRange(1, "100", "150");
+  ASSERT_TRUE(c != nullptr);
+  ASSERT_EQ("11", Inputs(c, 0));
+  // Only file 21 overlaps the range.  But a compaction of file 21 without file
+  // 22 could drop the deletion marker of "200", and the value in file 22 would
+  // be readable again.
+  ASSERT_EQ("21,22", Inputs(c, 1));
+  delete c;
+}
+
+TEST(CompactionInputsTest, ExpansionKeepsBoundaryFileOfNextLevel) {
+  AddFile(1, 11, InternalKey("050", 30, kTypeValue),
+          InternalKey("100", 31, kTypeValue));
+  AddFile(1, 12, InternalKey("120", 32, kTypeValue),
+          InternalKey("150", 33, kTypeValue));
+  AddFile(2, 21, InternalKey("010", 1, kTypeValue),
+          InternalKey("060", 2, kTypeValue));
+  // The two versions of user key "200" are split across files 22 and 23.
+  AddFile(2, 22, InternalKey("080", 3, kTypeValue),
+          InternalKey("200", 9, kTypeDeletion));
+  AddFile(2, 23, InternalKey("200", 5, kTypeValue),
+          InternalKey("300", 4, kTypeValue));
+  Install();
+
+  // File 12 overlaps file 22, and file 23 comes with it as its boundary file.
+  // The keys of files 22 and 23 also overlap file 11, so taking file 11 into
+  // the compaction is considered.  That is allowed only if it leaves the
+  // level-2 inputs as they are, which is checked by counting them.  With file
+  // 11 they would be 21, 22 and, as boundary file, 23: three files instead of
+  // two, so file 11 has to stay out.  If file 23 is not counted, {21, 22}
+  // passes for {22, 23} and file 23 is left behind.
+  Compaction* c = PickRange(1, "120", "150");
+  ASSERT_TRUE(c != nullptr);
+  ASSERT_EQ("22,23", Inputs(c, 1));
+  ASSERT_EQ("12", Inputs(c, 0));
+  delete c;
 }
 
 }  // namespace leveldb

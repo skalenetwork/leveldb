@@ -1407,6 +1407,71 @@ TEST(DBTest, DeletionMarkers2) {
   ASSERT_EQ(AllEntriesFor("foo"), "[ ]");
 }
 
+// Regression test for https://github.com/google/leveldb/issues/887.
+//
+// A snapshot makes a compaction keep both the deletion marker of a key and the
+// value it hides.  If the output file is cut between the two, that level then
+// holds the versions of the key in two adjacent files.  A later compaction into
+// the level that overlaps only the first of these files must still take both.
+// Otherwise it drops the deletion marker, because no deeper level has the key,
+// and the value in the second file can be read again.
+TEST(DBTest, DeletionMarkerSplitFromValueAcrossFiles) {
+  Options options = CurrentOptions();
+  options.create_if_missing = true;
+  options.compression = kNoCompression;  // Keeps the file sizes predictable.
+  options.max_file_size = 1 << 20;       // The smallest value allowed.
+  DestroyAndReopen(&options);
+
+  // Sorts after the filler keys used below.  Its entry alone is larger than
+  // the room that the fillers leave in a file, so it is the entry that fills
+  // the file.
+  const std::string key = "z" + std::string(100000, 'x');
+  const std::string filler(10000, 'f');
+  const int kNumFillers = 100;  // About 1 MB: a little less than one file.
+
+  ASSERT_OK(Put(key, "old"));
+  ASSERT_OK(dbfull()->TEST_CompactMemTable());
+  const int last = config::kMaxMemCompactLevel;
+  ASSERT_EQ(NumTableFilesAtLevel(last), 1);  // key => old is now in last level
+
+  // Delete the key while a snapshot still needs the old value.
+  const Snapshot* snapshot = db_->GetSnapshot();
+  ASSERT_OK(Delete(key));
+  for (int i = 0; i < kNumFillers; i++) {
+    ASSERT_OK(Put(Key(i), filler));
+  }
+  ASSERT_OK(dbfull()->TEST_CompactMemTable());  // Moves to level last-1
+  ASSERT_EQ(NumTableFilesAtLevel(last - 1), 1);
+  dbfull()->TEST_CompactRange(last - 1, nullptr, nullptr);
+  ASSERT_EQ(NumTableFilesAtLevel(last - 1), 0);
+  ASSERT_EQ(NumTableFilesAtLevel(last), 2);
+  ASSERT_EQ(AllEntriesFor(key), "[ DEL, old ]");
+  // The output was cut between the two versions: the first file ends with the
+  // deletion marker and the second file holds nothing but the old value.  So
+  // the key is three of the four bounds of the two files.
+  const std::string tables = DumpSSTableList();
+  int bounds = 0;
+  for (size_t pos = tables.find(key); pos != std::string::npos;
+       pos = tables.find(key, pos + key.size())) {
+    bounds++;
+  }
+  ASSERT_EQ(bounds, 3);
+  ASSERT_EQ(Get(key), "NOT_FOUND");
+  ASSERT_EQ(Get(key, snapshot), "old");
+  db_->ReleaseSnapshot(snapshot);
+
+  // Compact a range that overlaps the first of the two files only.
+  ASSERT_OK(Put(Key(0), "new"));
+  ASSERT_OK(dbfull()->TEST_CompactMemTable());  // Moves to level last-1
+  ASSERT_EQ(NumTableFilesAtLevel(last - 1), 1);
+  dbfull()->TEST_CompactRange(last - 1, nullptr, nullptr);
+  ASSERT_EQ(NumTableFilesAtLevel(last - 1), 0);
+
+  // The key has to stay deleted, with nothing left of it.
+  ASSERT_EQ(Get(key), "NOT_FOUND");
+  ASSERT_EQ(AllEntriesFor(key), "[ ]");
+}
+
 TEST(DBTest, OverlapInLevel0) {
   do {
     ASSERT_EQ(config::kMaxMemCompactLevel, 2) << "Fix test to match config";
